@@ -7,7 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,9 +22,8 @@ from telegram import (
     KeyboardButton,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
-    InlineQueryResultPhoto,
-    InputMediaAudio,
-    InputMediaVideo,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
 )
 from telegram.ext import (
     Application,
@@ -68,14 +67,6 @@ YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-# =========================================================
-# TIMEZONE HELPER
-# =========================================================
-def get_kyiv_time() -> str:
-    # Київський час (UTC+3 для простоти і уникнення сторонніх залежностей)
-    tz = timezone(timedelta(hours=3))
-    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-
 
 # =========================================================
 # DATABASE SYSTEM (SQLite / PostgreSQL)
@@ -104,18 +95,23 @@ def execute_query(query: str, params: tuple = (), fetchone=False, fetchall=False
         cursor.execute(sql, params)
         
         res = None
-        if fetchone: res = cursor.fetchone()
-        elif fetchall: res = cursor.fetchall()
+        if fetchone:
+            res = cursor.fetchone()
+        elif fetchall:
+            res = cursor.fetchall()
             
-        if commit: conn.commit()
+        if commit:
+            conn.commit()
         return res
     finally:
         conn.close()
 
 def sync_cookies_from_db():
     row = execute_query("SELECT value FROM settings WHERE key = ?", ("youtube_cookies",), fetchone=True)
-    if row and row[0]: COOKIES_FILE_PATH.write_text(row[0], encoding="utf-8")
-    elif YOUTUBE_COOKIES: COOKIES_FILE_PATH.write_text(YOUTUBE_COOKIES, encoding="utf-8")
+    if row and row[0]:
+        COOKIES_FILE_PATH.write_text(row[0], encoding="utf-8")
+    elif YOUTUBE_COOKIES:
+        COOKIES_FILE_PATH.write_text(YOUTUBE_COOKIES, encoding="utf-8")
 
 def save_db_cookies(content: str):
     execute_query("""
@@ -125,18 +121,32 @@ def save_db_cookies(content: str):
     COOKIES_FILE_PATH.write_text(content, encoding="utf-8")
 
 def init_db():
-    execute_query("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, lang TEXT)", commit=True)
-    for col in ["username", "first_name", "joined_date", "last_active"]:
-        try: execute_query(f"ALTER TABLE users ADD COLUMN {col} TEXT", commit=True)
-        except: pass
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            lang TEXT
+        )
+    """, commit=True)
+    
+    try: execute_query("ALTER TABLE users ADD COLUMN username TEXT", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN first_name TEXT", commit=True)
+    except: pass
     try: execute_query("ALTER TABLE users ADD COLUMN downloads INTEGER DEFAULT 0", commit=True)
     except: pass
     try: execute_query("ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT FALSE", commit=True)
     except: pass
-    try: execute_query("ALTER TABLE users ADD COLUMN tos_accepted BOOLEAN DEFAULT FALSE", commit=True)
+    try: execute_query("ALTER TABLE users ADD COLUMN joined_date TEXT", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN last_active TEXT", commit=True)
     except: pass
 
-    execute_query("CREATE TABLE IF NOT EXISTS admins (user_id BIGINT PRIMARY KEY)", commit=True)
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id BIGINT PRIMARY KEY
+        )
+    """, commit=True)
+    
     try: execute_query("ALTER TABLE admins ADD COLUMN added_by BIGINT", commit=True)
     except: pass
     try: execute_query("ALTER TABLE admins ADD COLUMN added_date TEXT", commit=True)
@@ -144,58 +154,75 @@ def init_db():
     try: execute_query("ALTER TABLE admins ADD COLUMN username TEXT", commit=True)
     except: pass
 
-    execute_query("CREATE TABLE IF NOT EXISTS admin_history (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id BIGINT, action TEXT, action_date TEXT)", commit=True)
-    
-    execute_query("CREATE TABLE IF NOT EXISTS channels (channel_id TEXT PRIMARY KEY, title TEXT, invite_link TEXT)", commit=True)
-    execute_query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)", commit=True)
-    execute_query("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT, url TEXT, download_date TEXT)", commit=True)
-    execute_query("CREATE TABLE IF NOT EXISTS inline_urls (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT)", commit=True)
-    
-    # Система зворотнього зв'язку
-    execute_query("CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT, status TEXT, created_at TEXT)", commit=True)
-    execute_query("CREATE TABLE IF NOT EXISTS ticket_msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER, sender TEXT, content TEXT, created_at TEXT)", commit=True)
-    
-    # Розсилки
-    execute_query("CREATE TABLE IF NOT EXISTS broadcasts (id INTEGER PRIMARY KEY AUTOINCREMENT, b_type TEXT, b_val TEXT, chat_id BIGINT, msg_id INTEGER, status TEXT)", commit=True)
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS channels (
+            channel_id TEXT PRIMARY KEY,
+            title TEXT,
+            invite_link TEXT
+        )
+    """, commit=True)
 
-    for k, v in [('caption_bot_enabled', 'false'), ('caption_custom_text', '')]:
-        if not execute_query("SELECT value FROM settings WHERE key = ?", (k,), fetchone=True):
-            execute_query("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v), commit=True)
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """, commit=True)
+    
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id BIGINT,
+            url TEXT,
+            download_date TEXT
+        )
+    """, commit=True)
+
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS inline_urls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT
+        )
+    """, commit=True)
+
+    row = execute_query("SELECT value FROM settings WHERE key = 'caption_bot_enabled'", fetchone=True)
+    if not row:
+        execute_query("INSERT INTO settings (key, value) VALUES ('caption_bot_enabled', 'false')", commit=True)
+    row = execute_query("SELECT value FROM settings WHERE key = 'caption_custom_text'", fetchone=True)
+    if not row:
+        execute_query("INSERT INTO settings (key, value) VALUES ('caption_custom_text', '')", commit=True)
 
     if INITIAL_ADMIN_ID > 0:
+        date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
         execute_query("""
             INSERT INTO admins (user_id, added_date, username) VALUES (?, ?, ?)
             ON CONFLICT (user_id) DO NOTHING
-        """, (INITIAL_ADMIN_ID, get_kyiv_time(), "Owner"), commit=True)
+        """, (INITIAL_ADMIN_ID, date_now, "Owner"), commit=True)
 
     sync_cookies_from_db()
 
 
-# --- User, Admin & System DB Helpers ---
+# --- User & Admin DB Helpers ---
 
 def register_or_update_user(user_id: int, username: str, first_name: str, lang: str = "ua"):
-    date_now = get_kyiv_time()
+    date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
     uname = username or ""
     fname = first_name or ""
     row = execute_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if not row:
         execute_query("""
-            INSERT INTO users (user_id, lang, username, first_name, joined_date, downloads, is_banned, last_active, tos_accepted)
-            VALUES (?, ?, ?, ?, ?, 0, FALSE, ?, FALSE)
+            INSERT INTO users (user_id, lang, username, first_name, joined_date, downloads, is_banned, last_active)
+            VALUES (?, ?, ?, ?, ?, 0, FALSE, ?)
         """, (user_id, lang, uname, fname, date_now, date_now), commit=True)
     else:
         execute_query("UPDATE users SET username = ?, first_name = ?, last_active = ? WHERE user_id = ?", 
                       (uname, fname, date_now, user_id), commit=True)
 
-def has_accepted_tos(user_id: int) -> bool:
-    row = execute_query("SELECT tos_accepted FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    return row[0] if row else False
-
-def accept_tos(user_id: int):
-    execute_query("UPDATE users SET tos_accepted = TRUE WHERE user_id = ?", (user_id,), commit=True)
-
 def get_user_info(user_id: int):
-    return execute_query("SELECT user_id, lang, username, first_name, downloads, is_banned, joined_date, last_active FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    return execute_query("""
+        SELECT user_id, lang, username, first_name, downloads, is_banned, joined_date, last_active 
+        FROM users WHERE user_id = ?
+    """, (user_id,), fetchone=True)
 
 def is_user_banned(user_id: int) -> bool:
     row = execute_query("SELECT is_banned FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -206,10 +233,11 @@ def set_user_ban(user_id: int, state: bool):
 
 def increment_downloads(user_id: int, url: str):
     execute_query("UPDATE users SET downloads = downloads + 1 WHERE user_id = ?", (user_id,), commit=True)
-    execute_query("INSERT INTO history (user_id, url, download_date) VALUES (?, ?, ?)", (user_id, url, get_kyiv_time()), commit=True)
+    date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    execute_query("INSERT INTO history (user_id, url, download_date) VALUES (?, ?, ?)", (user_id, url, date_now), commit=True)
 
-def get_user_history_all(user_id: int):
-    return execute_query("SELECT url, download_date FROM history WHERE user_id = ? ORDER BY id DESC", (user_id,), fetchall=True)
+def get_user_history(user_id: int, limit=5):
+    return execute_query("SELECT url, download_date FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit), fetchall=True)
 
 def get_user_lang(user_id: int) -> str:
     row = execute_query("SELECT lang FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -219,47 +247,54 @@ def set_user_lang(user_id: int, lang: str):
     execute_query("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id), commit=True)
 
 def is_admin(user_id: int) -> bool:
-    if user_id == INITIAL_ADMIN_ID: return True
-    return execute_query("SELECT user_id FROM admins WHERE user_id = ?", (user_id,), fetchone=True) is not None
+    if user_id == INITIAL_ADMIN_ID:
+        return True
+    row = execute_query("SELECT user_id FROM admins WHERE user_id = ?", (user_id,), fetchone=True)
+    return row is not None
 
 def add_admin(user_id: int, added_by: int, username: str = None):
+    date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
     execute_query("""
         INSERT INTO admins (user_id, added_by, added_date, username) VALUES (?, ?, ?, ?)
         ON CONFLICT (user_id) DO NOTHING
-    """, (user_id, added_by, get_kyiv_time(), username), commit=True)
-    log_admin_action(added_by, f"Додано адміністратора {user_id}")
+    """, (user_id, added_by, date_now, username), commit=True)
 
-def remove_admin(user_id: int, removed_by: int):
+def remove_admin(user_id: int):
     if user_id != INITIAL_ADMIN_ID:
         execute_query("DELETE FROM admins WHERE user_id = ?", (user_id,), commit=True)
-        log_admin_action(removed_by, f"Видалено адміністратора {user_id}")
 
 def get_all_admins_info():
-    return execute_query("""
-        SELECT a.user_id, a.added_by, a.added_date, COALESCE(u.first_name, a.username) as name
-        FROM admins a LEFT JOIN users u ON a.user_id = u.user_id
-    """, fetchall=True)
+    return execute_query("SELECT user_id, added_by, added_date, username FROM admins", fetchall=True)
 
 def get_admin_info(user_id: int):
-    return execute_query("""
-        SELECT a.user_id, a.added_by, a.added_date, COALESCE(u.first_name, a.username) as name, adder.first_name as adder_name
-        FROM admins a 
-        LEFT JOIN users u ON a.user_id = u.user_id
-        LEFT JOIN users adder ON a.added_by = adder.user_id
-        WHERE a.user_id = ?
-    """, (user_id,), fetchone=True)
+    return execute_query("SELECT user_id, added_by, added_date, username FROM admins WHERE user_id = ?", (user_id,), fetchone=True)
 
-def log_admin_action(admin_id: int, action: str):
-    execute_query("INSERT INTO admin_history (admin_id, action, action_date) VALUES (?, ?, ?)", (admin_id, action, get_kyiv_time()), commit=True)
+def get_sponsored_channels():
+    rows = execute_query("SELECT channel_id, title, invite_link FROM channels", fetchall=True)
+    return [{"id": r[0], "title": r[1], "link": r[2]} for r in rows] if rows else []
 
-def get_admin_history(admin_id: int):
-    return execute_query("SELECT action, action_date FROM admin_history WHERE admin_id = ? ORDER BY id DESC LIMIT 20", (admin_id,), fetchall=True)
+def get_sponsored_channel(channel_id: str):
+    row = execute_query("SELECT channel_id, title, invite_link FROM channels WHERE channel_id = ?", (channel_id,), fetchone=True)
+    return {"id": row[0], "title": row[1], "link": row[2]} if row else None
+
+def add_sponsored_channel(channel_id: str, title: str, link: str):
+    execute_query("""
+        INSERT INTO channels (channel_id, title, invite_link) VALUES (?, ?, ?)
+        ON CONFLICT (channel_id) DO UPDATE SET title = excluded.title, invite_link = excluded.invite_link
+    """, (channel_id, title, link), commit=True)
+
+def update_sponsored_channel(channel_id: str, title: str, link: str):
+    execute_query("UPDATE channels SET title = ?, invite_link = ? WHERE channel_id = ?", (title, link, channel_id), commit=True)
+
+def delete_sponsored_channel(channel_id: str):
+    execute_query("DELETE FROM channels WHERE channel_id = ?", (channel_id,), commit=True)
 
 def get_users_page(page: int, limit: int = 10):
     offset = (page - 1) * limit
     rows = execute_query("""
         SELECT user_id, lang, username, first_name, downloads, is_banned, COALESCE(last_active, joined_date) 
-        FROM users ORDER BY COALESCE(last_active, joined_date) DESC, user_id DESC LIMIT ? OFFSET ?
+        FROM users 
+        ORDER BY COALESCE(last_active, joined_date) DESC, user_id DESC LIMIT ? OFFSET ?
     """, (limit, offset), fetchall=True)
     total_rows = execute_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
     total_pages = max(1, (total_rows + limit - 1) // limit)
@@ -275,16 +310,23 @@ def get_inline_url(url_id: int) -> str:
     return row[0] if row else None
 
 def get_file_caption(bot_username: str) -> str:
-    bot_enabled = execute_query("SELECT value FROM settings WHERE key = 'caption_bot_enabled'", fetchone=True)
+    bot_enabled_row = execute_query("SELECT value FROM settings WHERE key = 'caption_bot_enabled'", fetchone=True)
     custom_row = execute_query("SELECT value FROM settings WHERE key = 'caption_custom_text'", fetchone=True)
     
+    bot_enabled = bot_enabled_row and bot_enabled_row[0] == "true"
+    custom_text = custom_row[0] if custom_row and custom_row[0] else ""
+    
     lines = []
-    if bot_enabled and bot_enabled[0] == "true" and bot_username:
+    if bot_enabled and bot_username:
         lines.append(f"@{bot_username}")
-    if custom_row and custom_row[0]:
-        if lines: lines.append("")
-        lines.append(custom_row[0])
+    
+    if custom_text:
+        if lines:
+            lines.append("")
+        lines.append(custom_text)
+        
     return "\n".join(lines) if lines else None
+
 
 # =========================================================
 # LOCALIZATION (TEXTS)
@@ -295,13 +337,7 @@ TEXTS = {
         "btn_settings": "⚙️ Налаштування",
         "btn_profile": "👤 Профіль",
         "btn_admin": "🔑 Адмін меню",
-        "btn_feedback": "✉️ Зворотній зв'язок",
         "start": "Привіт! 👋\nНадішли посилання на YouTube або YouTube Music.\nМожна відео, трек або плейлист.",
-        "tos_text": "📜 **Умови користування ботом**\n\nКористуючись цим ботом, ви погоджуєтесь з правилами використання. Ми не зберігаємо ваші файли і бот працює виключно як інструмент для завантаження.\n\nБудь ласка, прийміть умови для продовження.",
-        "tos_accept": "✅ Прийняти",
-        "tos_decline": "❌ Відхилити",
-        "tos_declined": "Ви відхилили умови користування. Використання бота неможливе.",
-        
         "choose_format": "Обери формат:",
         "audio_btn": "🎵 Аудіо",
         "video_btn": "🎬 Відео",
@@ -312,7 +348,7 @@ TEXTS = {
         "settings_lang": "Оберіть бажану мову інтерфейсу:",
         "lang_set": "✅ Мову успішно змінено на Українську 🇺🇦",
         
-        "profile_text": "👤 **Профіль користувача**\n\n**Ім'я:** {name}\n**ID:** `{id}`\n**Статус:** {status}\n**Останній онлайн (Київ):** {last_active}\n**Завантажень:** {downloads}",
+        "profile_text": "👤 **Профіль користувача**\n\n**Ім'я:** {name}\n**ID:** `{id}`\n**Статус:** {status}\n**Останній онлайн:** {last_active}\n**Завантажень:** {downloads}",
         "status_user": "Користувач 👤",
         "status_admin": "Адміністратор 👑",
         
@@ -321,135 +357,179 @@ TEXTS = {
         "sub_success": "✅ Дякуємо за підписку! Надішліть посилання ще раз.",
         "sub_failed": "❌ Ви підписалися не на всі канали!",
         "invalid_url": "❌ Надішли коректне посилання YouTube або YouTube Music.",
-        "banned_text": "❌ Ваш акаунт заблоковано.",
+        "banned_text": "❌ Ваш акаунт заблоковано. Ви не можете користуватись ботом.",
         
         "back_btn": "🔙 Назад",
         "cancel_btn": "❌ Скасувати",
         "close_btn": "❌ Закрити",
         
         "fetching_qualities": "🔎 Отримую список доступних якостей...",
-        "no_qualities": "❌ Не вдалося отримати варіанти якості.",
+        "no_qualities": "❌ Не вдалося отримати варіанти якості для цього відео.",
         "choose_quality": "📹 **{title}**\n\nОберіть бажану якість:",
-        "downloading_video": "⏳ Завантажую відео ({height}p)...",
-        "downloading_audio": "⏳ Завантажую аудіо...",
-        "file_too_large_video": "📦 **Файл перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити відео]({link})\n\n{caption}",
-        "file_too_large_audio": "📦 **Аудіо перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити аудіо]({link})\n\n{caption}",
-        "link_lost": "❌ Посилання втрачено. Надішліть його ще раз.",
+        "downloading_video": "⏳ Завантажую відео у якості {height}p...",
+        "downloading_audio": "⏳ Завантажую аудіо та обкладинку...",
+        "file_too_large_video": "📦 **Файл перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити відео]({link})",
+        "file_too_large_audio": "📦 **Аудіо перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити аудіо]({link})",
+        "link_lost": "❌ Посилання втрачено. Надішли його ще раз.",
         
         "admin_title": "🔑 **Панель адміністратора**",
-        "admin_list_admins_btn": "👥 Адміни",
+        "admin_list_admins_btn": "👥 Список адмінів",
         "admin_add_admin_btn": "➕ Додати адміна",
-        "admin_users_btn": "🔍 Пошук",
-        "admin_all_users_btn": "👥 Учасники",
-        "admin_caption_btn": "✍️ Підпис",
+        "admin_add_channel_btn": "📢 Додати спонсора",
+        "admin_list_channels_btn": "📋 Список спонсорів",
+        "admin_users_btn": "🔍 Пошук користувача",
+        "admin_all_users_btn": "👥 Список учасників",
+        "admin_caption_btn": "✍️ Додати підпис",
         "admin_broadcast_btn": "📢 Розсилка",
-        "admin_tickets_btn": "📨 Модерація звернень",
+        "admin_cookies_btn": "🍪 Оновити Cookies",
         
-        "admins_list_title": "👥 **Адміністратори:**",
-        "admin_info": "👑 **Адмін:** {name}\n🆔 `{id}`\n📅 **Доданий:** {date}\n👤 **Ким:** {added_by}",
-        "admin_del_btn": "🗑 Зняти адміна",
-        "admin_hist_btn": "🕒 Історія дій",
-        "admin_history_empty": "Історія пуста.",
+        "admin_enter_admin_id": "Надішліть Telegram ID користувача, якому хочете надати права адміна:",
+        "admin_enter_channel_data": "Надішліть дані каналу:\n`@channel_id Назва_Каналу https://t.me/link`",
+        "admin_enter_cookies": "🍪 Надішліть файл `cookies.txt` або його текст.",
+        "cookies_updated": "✅ Cookies успішно збережено та оновлено!",
+        "admin_channel_added": "✅ Канал `{title}` додано до спонсорів!",
+        "admin_invalid_channel_format": "❌ Невірний формат. Введіть: `@channel_id Назва Посилання`",
+        "admin_admin_added": "✅ Користувача успішно додано до адмінів!",
+        "admin_invalid_id": "❌ Введіть числовий Telegram ID.",
         
-        "user_info_admin": "👤 **Профіль:** {name}\n🆔 `{id}`\n🕒 **Онлайн:** {last_active}\n📥 **Завантажень:** {downloads}\n🚫 **Бан:** {banned}",
+        "sponsors_empty": "📋 **Спонсорських каналів немає.**",
+        "sponsors_list_title": "📋 **Керування спонсорами:**",
+        "sponsor_info": "📢 **Канал:** {title}\n🆔 **ID:** `{id}`\n🔗 **Посилання:** {link}",
+        "edit_btn": "✏️ Редагувати",
+        "delete_btn": "🗑 Видалити",
+        "sponsor_deleted": "✅ Канал видалено!",
+        "edit_sponsor_prompt": "Надішліть нову назву та посилання через пробіл:\n`Нова_Назва https://t.me/link`",
+        "sponsor_updated": "✅ Дані каналу оновлено!",
+        
+        "admins_list_title": "👥 **Список адміністраторів:**",
+        "admin_info": "👑 **Адміністратор:** {name}\n🆔 **ID:** `{id}`\n📅 **Доданий:** {date}\n👤 **Ким доданий:** `{added_by}`",
+        "admin_deleted": "✅ Адміністратора видалено!",
+        "cant_delete_owner": "❌ Головного адміна видалити неможливо!",
+        
+        "admin_search_user_prompt": "🔍 Надішліть Telegram ID користувача для пошуку:",
+        "user_not_found": "❌ Користувача з таким ID не знайдено в базі.",
+        "user_info_admin": "👤 **Профіль:** {name}\n🆔 **ID:** `{id}`\n🕒 **Останній онлайн:** {last_active}\n📥 **Завантажень:** {downloads}\n🚫 **Бан:** {banned}",
         "ban_btn": "🚫 Забанити",
         "unban_btn": "✅ Розбанити",
-        "history_btn": "🕒 Історія завантажень",
-        "make_admin_btn": "👑 Призначити адміном",
-        "user_history_title": "🕒 **Всі завантаження ({id}):**\n",
+        "history_btn": "🕒 Історія",
+        "user_banned_success": "✅ Користувача забанено.",
+        "user_unbanned_success": "✅ Користувача розбанено.",
+        "user_history_title": "🕒 **Останні завантаження ({id}):**\n",
+        "user_history_empty": "Історія порожня.",
         
-        "broadcast_menu": "📢 **Конструктор розсилки**\n\nОберіть тип розсилки:",
-        "bc_immediate": "⚡ Одразу",
-        "bc_scheduled": "🕒 За розкладом",
-        "bc_counter": "🔄 Кожен N-й запит",
+        "users_list_title": "👥 **Список учасників бота (Сторінка {page}/{total}):**",
         
-        "feedback_menu": "✉️ **Зворотній зв'язок**\nОберіть дію:",
-        "fb_new": "📝 Написати звернення",
-        "fb_history": "🕒 Мої звернення",
-        "fb_prompt": "Надішліть повідомлення для звернення (можна декілька). По завершенню натисніть кнопку відправити.",
-        "fb_send_btn": "📤 Відправити звернення",
-        "fb_sent": "✅ Звернення відправлено адміністраторам!",
-        "fb_mod_empty": "🎉 Відкритих звернень немає.",
+        "caption_menu_title": "✍️ **Керування підписом до файлів:**\n\n• **Підпис бота:** `{bot_status}`\n• **Додаткова стрічка:** `{custom_text}`",
+        "toggle_bot_caption_btn": "🤖 Підпис бота: {status}",
+        "edit_custom_caption_btn": "✏️ Додаткова стрічка",
+        "caption_prompt": "Надішліть текст, який буде додаватись після юзернейма бота (або надішліть `-`, щоб очистити):",
+        "caption_saved": "✅ Підпис успішно оновлено!",
+        
+        "broadcast_prompt": "📢 Надішліть повідомлення для розсилки (текст, фото, відео тощо з кнопками або без):",
+        "broadcast_confirm_btn": "🚀 Підтвердити та запустити розсилку",
+        "broadcast_started": "⏳ Розсилка розпочата...",
+        "broadcast_finished": "✅ Розсилка завершена.\n\n• **Успішно:** {success}\n• **Помилок (заблокували бота):** {failed}",
+
+        "action_cancelled": "✅ Дія скасована."
     },
     "en": {
         "btn_settings": "⚙️ Settings",
         "btn_profile": "👤 Profile",
         "btn_admin": "🔑 Admin Panel",
-        "btn_feedback": "✉️ Feedback",
-        "start": "Hello! 👋\nSend a YouTube or YouTube Music link.",
-        "tos_text": "📜 **Terms of Service**\n\nPlease accept the terms to continue using the bot.",
-        "tos_accept": "✅ Accept",
-        "tos_decline": "❌ Decline",
-        "tos_declined": "You declined the Terms of Service. You cannot use the bot.",
-        
+        "start": "Hello! 👋\nSend a YouTube or YouTube Music link.\nVideo, track, or playlist supported.",
         "choose_format": "Choose format:",
         "audio_btn": "🎵 Audio",
         "video_btn": "🎬 Video",
         "download_audio": "🎵 Download audio",
         
-        "settings_main": "⚙️ **Settings**",
+        "settings_main": "⚙️ **Settings**\nSelect a section:",
         "lang_menu_btn": "🌐 Language",
-        "settings_lang": "Select language:",
-        "lang_set": "✅ Language set to English 🇬🇧",
+        "settings_lang": "Select your preferred interface language:",
+        "lang_set": "✅ Language successfully set to English 🇬🇧",
         
-        "profile_text": "👤 **Profile**\n\n**Name:** {name}\n**ID:** `{id}`\n**Status:** {status}\n**Last active:** {last_active}\n**Downloads:** {downloads}",
+        "profile_text": "👤 **User Profile**\n\n**Name:** {name}\n**ID:** `{id}`\n**Status:** {status}\n**Last active:** {last_active}\n**Downloads:** {downloads}",
         "status_user": "User 👤",
         "status_admin": "Administrator 👑",
         
-        "sub_required": "⚠️ **Please subscribe to our channels:**",
+        "sub_required": "⚠️ **Please subscribe to our sponsor channels:**",
         "check_sub_btn": "🔄 Check subscription",
-        "sub_success": "✅ Subscribed! Send link again.",
-        "sub_failed": "❌ Not subscribed to all channels!",
-        "invalid_url": "❌ Send a valid link.",
-        "banned_text": "❌ Your account is banned.",
+        "sub_success": "✅ Thank you for subscribing! Please send the link again.",
+        "sub_failed": "❌ You have not subscribed to all channels!",
+        "invalid_url": "❌ Please send a valid YouTube or YouTube Music link.",
+        "banned_text": "❌ Your account is banned. You cannot use this bot.",
         
         "back_btn": "🔙 Back",
         "cancel_btn": "❌ Cancel",
         "close_btn": "❌ Close",
         
-        "fetching_qualities": "🔎 Fetching qualities...",
-        "no_qualities": "❌ No qualities available.",
-        "choose_quality": "📹 **{title}**\n\nChoose quality:",
-        "downloading_video": "⏳ Downloading video ({height}p)...",
-        "downloading_audio": "⏳ Downloading audio...",
-        "file_too_large_video": "📦 **File > 50 MB** ({mb} MB).\n\n🔗 [Download video]({link})\n\n{caption}",
-        "file_too_large_audio": "📦 **Audio > 50 MB** ({mb} MB).\n\n🔗 [Download audio]({link})\n\n{caption}",
-        "link_lost": "❌ Link lost.",
+        "fetching_qualities": "🔎 Fetching available video qualities...",
+        "no_qualities": "❌ Could not get quality options for this video.",
+        "choose_quality": "📹 **{title}**\n\nChoose desired quality:",
+        "downloading_video": "⏳ Downloading video in {height}p quality...",
+        "downloading_audio": "⏳ Downloading audio & cover art...",
+        "file_too_large_video": "📦 **File exceeds 50 MB** ({mb} MB).\n\n🔗 [Click here to download video]({link})",
+        "file_too_large_audio": "📦 **Audio exceeds 50 MB** ({mb} MB).\n\n🔗 [Click here to download audio]({link})",
+        "link_lost": "❌ Link lost. Please send it again.",
         
         "admin_title": "🔑 **Admin Panel**",
-        "admin_list_admins_btn": "👥 Admins",
+        "admin_list_admins_btn": "👥 Admins List",
         "admin_add_admin_btn": "➕ Add Admin",
-        "admin_users_btn": "🔍 Search",
-        "admin_all_users_btn": "👥 Users",
-        "admin_caption_btn": "✍️ Signature",
+        "admin_add_channel_btn": "📢 Add Sponsor",
+        "admin_list_channels_btn": "📋 Sponsor List",
+        "admin_users_btn": "🔍 Search User",
+        "admin_all_users_btn": "👥 Users List",
+        "admin_caption_btn": "✍️ Add Signature",
         "admin_broadcast_btn": "📢 Broadcast",
-        "admin_tickets_btn": "📨 Tickets Mod",
+        "admin_cookies_btn": "🍪 Update Cookies",
         
-        "admins_list_title": "👥 **Admins:**",
-        "admin_info": "👑 **Admin:** {name}\n🆔 `{id}`\n📅 **Added:** {date}\n👤 **By:** {added_by}",
-        "admin_del_btn": "🗑 Remove",
-        "admin_hist_btn": "🕒 History",
-        "admin_history_empty": "History empty.",
+        "admin_enter_admin_id": "Send the Telegram ID to promote to admin:",
+        "admin_enter_channel_data": "Send channel details:\n`@channel_id Name https://t.me/link`",
+        "admin_enter_cookies": "🍪 Send the `cookies.txt` file or paste text.",
+        "cookies_updated": "✅ Cookies successfully saved!",
+        "admin_channel_added": "✅ Channel added to sponsors!",
+        "admin_invalid_channel_format": "❌ Invalid format.",
+        "admin_admin_added": "✅ User added as admin!",
+        "admin_invalid_id": "❌ Please enter a numeric Telegram ID.",
         
-        "user_info_admin": "👤 **User:** {name}\n🆔 `{id}`\n🕒 **Active:** {last_active}\n📥 **Downloads:** {downloads}\n🚫 **Banned:** {banned}",
+        "sponsors_empty": "📋 **No sponsor channels found.**",
+        "sponsors_list_title": "📋 **Sponsors Management:**",
+        "sponsor_info": "📢 **Channel:** {title}\n🆔 **ID:** `{id}`\n🔗 **Link:** {link}",
+        "edit_btn": "✏️ Edit",
+        "delete_btn": "🗑 Delete",
+        "sponsor_deleted": "✅ Channel deleted!",
+        "edit_sponsor_prompt": "Send new name and link:\n`New_Name https://t.me/link`",
+        "sponsor_updated": "✅ Channel updated!",
+        
+        "admins_list_title": "👥 **Administrators List:**",
+        "admin_info": "👑 **Admin:** {name}\n🆔 **ID:** `{id}`\n📅 **Added:** {date}\n👤 **Added by:** `{added_by}`",
+        "admin_deleted": "✅ Admin removed!",
+        "cant_delete_owner": "❌ Cannot remove the main owner!",
+        
+        "admin_search_user_prompt": "🔍 Send Telegram ID to search:",
+        "user_not_found": "❌ User not found in DB.",
+        "user_info_admin": "👤 **Profile:** {name}\n🆔 **ID:** `{id}`\n🕒 **Last active:** {last_active}\n📥 **Downloads:** {downloads}\n🚫 **Banned:** {banned}",
         "ban_btn": "🚫 Ban",
         "unban_btn": "✅ Unban",
         "history_btn": "🕒 History",
-        "make_admin_btn": "👑 Make Admin",
-        "user_history_title": "🕒 **All Downloads ({id}):**\n",
+        "user_banned_success": "✅ User banned.",
+        "user_unbanned_success": "✅ User unbanned.",
+        "user_history_title": "🕒 **Recent Downloads ({id}):**\n",
+        "user_history_empty": "History is empty.",
         
-        "broadcast_menu": "📢 **Broadcast Builder**\n\nChoose type:",
-        "bc_immediate": "⚡ Immediate",
-        "bc_scheduled": "🕒 Scheduled",
-        "bc_counter": "🔄 Every Nth request",
+        "users_list_title": "👥 **Bot Users List (Page {page}/{total}):**",
         
-        "feedback_menu": "✉️ **Feedback**\nSelect:",
-        "fb_new": "📝 New Ticket",
-        "fb_history": "🕒 My Tickets",
-        "fb_prompt": "Send your message(s) and click Send when done.",
-        "fb_send_btn": "📤 Send Ticket",
-        "fb_sent": "✅ Ticket sent!",
-        "fb_mod_empty": "🎉 No open tickets.",
+        "caption_menu_title": "✍️ **File Signature Settings:**\n\n• **Bot Signature:** `{bot_status}`\n• **Additional Line:** `{custom_text}`",
+        "toggle_bot_caption_btn": "🤖 Bot Signature: {status}",
+        "edit_custom_caption_btn": "✏️ Additional Line",
+        "caption_prompt": "Send text for additional line after bot username (or send `-` to clear):",
+        "caption_saved": "✅ Signature updated successfully!",
+        
+        "broadcast_prompt": "📢 Send message for broadcast (text, photo, media, etc.):",
+        "broadcast_confirm_btn": "🚀 Confirm and Start Broadcast",
+        "broadcast_started": "⏳ Broadcast started...",
+        "broadcast_finished": "✅ Broadcast completed.\n\n• **Successful:** {success}\n• **Failed (blocked):** {failed}",
+
+        "action_cancelled": "✅ Action cancelled."
     }
 }
 
@@ -463,6 +543,7 @@ def get_text(lang: str, key: str) -> str:
 # =========================================================
 
 async def setup_bot_commands(app_bot):
+    # Повне видалення підказок для команд 
     try: await app_bot.delete_my_commands()
     except: pass
     try: await app_bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
@@ -472,8 +553,7 @@ async def setup_bot_commands(app_bot):
 
 def get_main_keyboard(user_id: int, lang: str) -> ReplyKeyboardMarkup:
     keys = [
-        [KeyboardButton(get_text(lang, "btn_settings")), KeyboardButton(get_text(lang, "btn_profile"))],
-        [KeyboardButton(get_text(lang, "btn_feedback"))]
+        [KeyboardButton(get_text(lang, "btn_settings")), KeyboardButton(get_text(lang, "btn_profile"))]
     ]
     if is_admin(user_id):
         keys.append([KeyboardButton(get_text(lang, "btn_admin"))])
@@ -484,7 +564,27 @@ def get_cancel_inline(lang: str, callback_data: str) -> InlineKeyboardMarkup:
 
 
 # =========================================================
-# YT-DLP CORE LOGIC
+# SPONSOR SUB CHECKER
+# =========================================================
+
+async def check_user_subscriptions(bot, user_id: int):
+    channels = get_sponsored_channels()
+    unsubscribed = []
+    
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
+            if member.status not in ["creator", "administrator", "member"]:
+                unsubscribed.append(ch)
+        except Exception as e:
+            logger.warning("Could not check membership for channel %s: %s", ch["id"], e)
+            unsubscribed.append(ch)
+            
+    return unsubscribed
+
+
+# =========================================================
+# YT-DLP CORE LOGIC (UNCHANGED)
 # =========================================================
 
 def youtube_options_base():
@@ -494,52 +594,68 @@ def youtube_options_base():
         "socket_timeout": 30,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
         },
         "extractor_args": {
             "youtube": {"player_client": ["android_vr", "mweb"]},
             "youtubepot-bgutilhttp": {"base_url": f"http://127.0.0.1:{BGUTIL_PORT}"},
         },
-        "js_runtimes": {"node": {"path": str(LOCAL_NODE_BIN / "node")}},
+        "js_runtimes": {
+            "node": {"path": str(LOCAL_NODE_BIN / "node")}
+        },
     }
-    if COOKIES_FILE_PATH.is_file(): options["cookiefile"] = str(COOKIES_FILE_PATH)
+
+    if COOKIES_FILE_PATH.is_file():
+        options["cookiefile"] = str(COOKIES_FILE_PATH)
+
     return options
+
 
 def start_bgutil_provider():
     global BGUTIL_PROCESS
-    if not BGUTIL_MAIN.is_file() or not (LOCAL_NODE_BIN / "node").is_file(): return False
+    if not BGUTIL_MAIN.is_file() or not (LOCAL_NODE_BIN / "node").is_file():
+        return False
+
     BGUTIL_PROCESS = subprocess.Popen(
         [str(LOCAL_NODE_BIN / "node"), str(BGUTIL_MAIN), "--port", str(BGUTIL_PORT)],
-        cwd=str(BGUTIL_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=os.environ.copy(),
+        cwd=str(BGUTIL_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
     )
+
     import urllib.request
     deadline = time.time() + 15
     while time.time() < deadline:
-        if BGUTIL_PROCESS.poll() is not None: return False
+        if BGUTIL_PROCESS.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{BGUTIL_PORT}/ping", timeout=1) as resp:
-                if resp.status == 200: return True
-        except Exception: time.sleep(0.25)
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.25)
     return False
 
 def stop_bgutil_provider():
     global BGUTIL_PROCESS
     if BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None:
         BGUTIL_PROCESS.terminate()
-        try: BGUTIL_PROCESS.wait(timeout=5)
-        except: BGUTIL_PROCESS.kill()
+        try:
+            BGUTIL_PROCESS.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            BGUTIL_PROCESS.kill()
     BGUTIL_PROCESS = None
 
 def human_youtube_error(error: Exception) -> str:
     text = str(error)
-    if "Sign in to confirm" in text: return "YouTube заблокував запит (anti-bot). Оновіть cookies."
+    if "Sign in to confirm you’re not a bot" in text:
+        return "YouTube заблокував запит (anti-bot). Оновіть cookies в адмін-панелі."
     return text[:1000]
 
-def extract_yt_id(url: str):
-    match = re.search(r"(?:v=|/)([0-9A-Za-z_-]{11}).*", url)
-    return match.group(1) if match else None
-
 def is_youtube_url(url: str) -> bool:
-    return bool(re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/", url, re.IGNORECASE))
+    pattern = r"^https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/"
+    return bool(re.match(pattern, url, re.IGNORECASE))
 
 def is_youtube_music_url(url: str) -> bool:
     return bool(re.match(r"^https?://music\.youtube\.com/", url, re.IGNORECASE))
@@ -552,11 +668,13 @@ def get_video_formats_info(url: str):
         info = ydl.extract_info(url, download=False)
         
     formats = info.get("formats", [])
+    
     audio_bytes = 0
     for f in formats:
         if f.get("vcodec") == "none" and f.get("acodec") != "none":
             sz = f.get("filesize") or f.get("filesize_approx") or 0
-            if sz > audio_bytes: audio_bytes = sz
+            if sz > audio_bytes:
+                audio_bytes = sz
 
     height_tiers = [1080, 720, 480, 360]
     available_qualities = []
@@ -568,7 +686,8 @@ def get_video_formats_info(url: str):
             if f.get("vcodec") != "none" and f.get("height") == h:
                 found = True
                 sz = f.get("filesize") or f.get("filesize_approx") or 0
-                if sz > video_bytes: video_bytes = sz
+                if sz > video_bytes:
+                    video_bytes = sz
 
         if found:
             total_bytes = video_bytes + audio_bytes
@@ -594,113 +713,131 @@ def download_audio(url: str, workdir: str):
             {"key": "EmbedThumbnail", "already_have_thumbnail": False},
         ],
     })
+
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_file = str(Path(filename).with_suffix(".mp3"))
+            if os.path.exists(mp3_file): return mp3_file, info
             mp3_files = list(Path(workdir).glob("*.mp3"))
             if mp3_files: return str(mp3_files[0]), info
-    except Exception:
-        fallback_opts = youtube_options_base()
-        fallback_opts.update({"format": "bestaudio/best", "outtmpl": output, "noplaylist": True, "quiet": True, "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}]})
-        with YoutubeDL(fallback_opts) as ydl:
+    except Exception as e:
+        logger.warning("Cover embed failed (%s). Fallback to clean MP3...", e)
+        fallback_options = youtube_options_base()
+        fallback_options.update({
+            "format": "bestaudio/best",
+            "outtmpl": output,
+            "writethumbnail": False,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"},
+                {"key": "FFmpegMetadata", "add_metadata": True},
+            ],
+        })
+        with YoutubeDL(fallback_options) as ydl:
             info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_file = str(Path(filename).with_suffix(".mp3"))
+            if os.path.exists(mp3_file): return mp3_file, info
             mp3_files = list(Path(workdir).glob("*.mp3"))
             if mp3_files: return str(mp3_files[0]), info
+
     raise FileNotFoundError("MP3 file not found.")
 
 def download_video_quality(url: str, workdir: str, height: int):
     output = str(Path(workdir) / "%(title).80s.%(ext)s")
     options = youtube_options_base()
-    # Універсальний безпечний формат з фолбеком на best
     options.update({
-        "format": f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+        "format": f"bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4][height<={height}]/best[height<={height}]",
         "outtmpl": output,
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
+        "no_warnings": True,
     })
+    
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        mp4_file = str(Path(filename).with_suffix(".mp4"))
+        
+        if os.path.exists(mp4_file): return mp4_file, info
         video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
         if video_files: return str(video_files[0]), info
         raise FileNotFoundError("Video file not found.")
 
 
 # =========================================================
-# TELEGRAM HANDLERS
+# LOGGING
 # =========================================================
+
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+if not TOKEN or not PUBLIC_URL:
+    raise RuntimeError("BOT_TOKEN or PUBLIC_URL is missing!")
+WEBHOOK_URL = f"{PUBLIC_URL}/telegram/webhook"
+
+
+# =========================================================
+# TELEGRAM HANDLERS
+# =========================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_or_update_user(user.id, user.username or "", user.first_name or "")
+    username = user.username or ""
+    first_name = user.first_name or ""
+    register_or_update_user(user.id, username, first_name)
+    
     lang = get_user_lang(user.id)
-    
-    if not has_accepted_tos(user.id):
-        kb = [[InlineKeyboardButton(get_text(lang, "tos_accept"), callback_data="tos_accept"),
-               InlineKeyboardButton(get_text(lang, "tos_decline"), callback_data="tos_decline")]]
-        await update.message.reply_text(get_text(lang, "tos_text"), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        return
-
-    await update.message.reply_text(get_text(lang, "start"), reply_markup=get_main_keyboard(user.id, lang))
-
-async def check_trigger_broadcast(bot, user_id: int):
-    # Логіка N-го запиту
-    uinfo = get_user_info(user_id)
-    if not uinfo: return
-    dls = uinfo[4]
-    
-    # Шукаємо активні розсилки типу counter
-    bc = execute_query("SELECT id, b_val, chat_id, msg_id FROM broadcasts WHERE b_type='counter' AND status='active'", fetchall=True)
-    for b in bc:
-        target = int(b[1])
-        if dls > 0 and dls % target == 0:
-            try: await bot.copy_message(chat_id=user_id, from_chat_id=b[2], message_id=b[3])
-            except: pass
+    await update.message.reply_text(
+        get_text(lang, "start"),
+        reply_markup=get_main_keyboard(user.id, lang)
+    )
 
 async def master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip() if update.message.text else ""
-    register_or_update_user(user.id, user.username or "", user.first_name or "")
-    lang = get_user_lang(user.id)
     
-    if not has_accepted_tos(user.id):
-        kb = [[InlineKeyboardButton(get_text(lang, "tos_accept"), callback_data="tos_accept"), InlineKeyboardButton(get_text(lang, "tos_decline"), callback_data="tos_decline")]]
-        await update.message.reply_text(get_text(lang, "tos_text"), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        return
-
+    register_or_update_user(user.id, user.username or "", user.first_name or "")
+    
     if is_user_banned(user.id):
+        lang = get_user_lang(user.id)
         await update.message.reply_text(get_text(lang, "banned_text"))
         return
 
+    lang = get_user_lang(user.id)
+    
     admin_state = context.user_data.get("admin_state")
     if admin_state:
         await handle_admin_inputs(update, context, text, admin_state, lang)
         return
-        
-    user_state = context.user_data.get("user_state")
-    if user_state == "await_ticket_message":
-        execute_query("INSERT INTO ticket_msgs (ticket_id, sender, content, created_at) VALUES (0, ?, ?, ?)", (str(user.id), update.message.text or "(Медіа файл)", get_kyiv_time()), commit=True)
-        kb = [[InlineKeyboardButton(get_text(lang, "fb_send_btn"), callback_data="fb_send")], [InlineKeyboardButton(get_text(lang, "cancel_btn"), callback_data="close_menu")]]
-        await update.message.reply_text("✅ Записано. Можете надіслати ще повідомлення або відправити.", reply_markup=InlineKeyboardMarkup(kb))
-        return
 
     if text in [TEXTS["ua"]["btn_settings"], TEXTS["en"]["btn_settings"]]:
-        keyboard = [[InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")], [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]]
+        keyboard = [
+            [InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")],
+            [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
+        ]
         await update.message.reply_text(get_text(lang, "settings_main"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
         
     if text in [TEXTS["ua"]["btn_profile"], TEXTS["en"]["btn_profile"]]:
         info = get_user_info(user.id)
         status = get_text(lang, "status_admin") if is_admin(user.id) else get_text(lang, "status_user")
-        profile_msg = get_text(lang, "profile_text").format(name=info[3] or info[2] or f"ID: {user.id}", id=user.id, status=status, last_active=info[7] or info[6], downloads=info[4])
-        await update.message.reply_text(profile_msg, parse_mode="Markdown")
-        return
         
-    if text in [TEXTS["ua"]["btn_feedback"], TEXTS["en"]["btn_feedback"]]:
-        keyboard = [[InlineKeyboardButton(get_text(lang, "fb_new"), callback_data="fb_new_ticket")], [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]]
-        await update.message.reply_text(get_text(lang, "feedback_menu"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        last_act = info[7] if (len(info) > 7 and info[7]) else (info[6] if len(info) > 6 else "-")
+        
+        profile_msg = get_text(lang, "profile_text").format(
+            name=info[3] or info[2] or f"ID: {user.id}",
+            id=user.id,
+            status=status,
+            last_active=last_act,
+            downloads=info[4] if len(info)>4 else 0
+        )
+        await update.message.reply_text(profile_msg, parse_mode="Markdown")
         return
 
     if text in [TEXTS["ua"]["btn_admin"], TEXTS["en"]["btn_admin"]]:
@@ -708,389 +845,685 @@ async def master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard = [
             [InlineKeyboardButton(get_text(lang, "admin_list_admins_btn"), callback_data="admin_list_admins")],
             [InlineKeyboardButton(get_text(lang, "admin_users_btn"), callback_data="admin_users"), InlineKeyboardButton(get_text(lang, "admin_all_users_btn"), callback_data="users_page:1")],
-            [InlineKeyboardButton(get_text(lang, "admin_tickets_btn"), callback_data="admin_tickets")],
+            [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
             [InlineKeyboardButton(get_text(lang, "admin_caption_btn"), callback_data="admin_caption_menu"), InlineKeyboardButton(get_text(lang, "admin_broadcast_btn"), callback_data="admin_broadcast")],
+            [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
             [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
         ]
         await update.message.reply_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
     if text:
+        unsubscribed = await check_user_subscriptions(context.bot, user.id)
+        if unsubscribed:
+            keyboard = [[InlineKeyboardButton(f"👉 {ch['title']}", url=ch['link'])] for ch in unsubscribed]
+            keyboard.append([InlineKeyboardButton(get_text(lang, "check_sub_btn"), callback_data="check_subscription")])
+            await update.message.reply_text(get_text(lang, "sub_required"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
+
         if not is_youtube_url(text):
             await update.message.reply_text(get_text(lang, "invalid_url"))
             return
+
         context.user_data["url"] = text
         await send_format_selection(update.message, text, lang)
 
+
 async def send_format_selection(message, url: str, lang: str, is_edit=False):
-    kb = [[InlineKeyboardButton(get_text(lang, "download_audio"), callback_data="audio")]] if is_youtube_music_url(url) else [[InlineKeyboardButton(get_text(lang, "audio_btn"), callback_data="audio"), InlineKeyboardButton(get_text(lang, "video_btn"), callback_data="video")]]
-    text = "🎵 YouTube Music" if is_youtube_music_url(url) else get_text(lang, "choose_format")
-    if is_edit: await message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else: await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    if is_youtube_music_url(url):
+        keyboard = [[InlineKeyboardButton(get_text(lang, "download_audio"), callback_data="audio")]]
+        text = "🎵 YouTube Music"
+    else:
+        keyboard = [[
+            InlineKeyboardButton(get_text(lang, "audio_btn"), callback_data="audio"),
+            InlineKeyboardButton(get_text(lang, "video_btn"), callback_data="video"),
+        ]]
+        text = get_text(lang, "choose_format")
+
+    markup = InlineKeyboardMarkup(keyboard)
+    if is_edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.reply_text(text, reply_markup=markup)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    lang = get_user_lang(user_id)
-    register_or_update_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "")
+    
+    user = update.effective_user
+    user_id = user.id
+    # Фіксуємо активність
+    register_or_update_user(user_id, user.username or "", user.first_name or "")
     
     data = query.data
-    
-    if data == "tos_accept":
-        accept_tos(user_id)
-        await query.edit_message_text("✅")
-        await update.effective_user.send_message(get_text(lang, "start"), reply_markup=get_main_keyboard(user_id, lang))
-        return
-    if data == "tos_decline":
-        await query.edit_message_text(get_text(lang, "tos_declined"))
-        return
+    lang = get_user_lang(user_id)
 
     if is_user_banned(user_id):
         await query.edit_message_text(get_text(lang, "banned_text"))
         return
 
-    if data in ["close_menu", "cancel_admin_action"]:
+    if data == "close_menu":
         context.user_data["admin_state"] = None
-        context.user_data["user_state"] = None
         await query.message.delete()
+        return
+        
+    if data == "cancel_admin_action":
+        context.user_data["admin_state"] = None
+        await query.edit_message_text(get_text(lang, "action_cancelled"))
         return
         
     if data == "cancel_to_admin_menu":
         context.user_data["admin_state"] = None
         data = "admin_menu"
-        
+
+    if data == "noop":
+        return
+
     if data == "settings_lang":
-        kb = [[InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang:ua"), InlineKeyboardButton("🇬🇧 English", callback_data="set_lang:en")], [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="settings_main")]]
-        await query.edit_message_text(get_text(lang, "settings_lang"), reply_markup=InlineKeyboardMarkup(kb))
-        return
-    if data == "settings_main":
-        kb = [[InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")], [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]]
-        await query.edit_message_text(get_text(lang, "settings_main"), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        return
-    if data.startswith("set_lang:"):
-        set_user_lang(user_id, data.split(":")[1])
-        await query.message.delete()
-        await query.message.reply_text(get_text(data.split(":")[1], "lang_set"), reply_markup=get_main_keyboard(user_id, data.split(":")[1]))
+        keyboard = [
+            [InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang:ua"), InlineKeyboardButton("🇬🇧 English", callback_data="set_lang:en")],
+            [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="settings_main")]
+        ]
+        await query.edit_message_text(get_text(lang, "settings_lang"), reply_markup=InlineKeyboardMarkup(keyboard))
         return
         
-    # --- FEEDBACK ---
-    if data == "fb_new_ticket":
-        context.user_data["user_state"] = "await_ticket_message"
-        await query.edit_message_text(get_text(lang, "fb_prompt"), reply_markup=get_cancel_inline(lang, "close_menu"))
+    if data == "settings_main":
+        keyboard = [[InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")], [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]]
+        await query.edit_message_text(get_text(lang, "settings_main"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
-    if data == "fb_send":
-        context.user_data["user_state"] = None
-        execute_query("INSERT INTO tickets (user_id, status, created_at) VALUES (?, 'open', ?)", (user_id, get_kyiv_time()), commit=True)
-        tid = execute_query("SELECT MAX(id) FROM tickets", fetchone=True)[0]
-        execute_query("UPDATE ticket_msgs SET ticket_id = ? WHERE ticket_id = 0 AND sender = ?", (tid, str(user_id)), commit=True)
-        await query.edit_message_text(get_text(lang, "fb_sent"))
+
+    if data.startswith("set_lang:"):
+        new_lang = data.split(":")[1]
+        set_user_lang(user_id, new_lang)
+        await query.message.delete()
+        await query.message.reply_text(get_text(new_lang, "lang_set"), reply_markup=get_main_keyboard(user_id, new_lang))
+        return
+
+    if data == "check_subscription":
+        unsubscribed = await check_user_subscriptions(context.bot, user_id)
+        if not unsubscribed:
+            await query.edit_message_text(get_text(lang, "sub_success"))
+        else:
+            await query.answer(get_text(lang, "sub_failed"), show_alert=True)
         return
 
     # --- ADMIN CALLBACKS ---
     if data == "admin_menu" and is_admin(user_id):
-        kb = [
+        keyboard = [
             [InlineKeyboardButton(get_text(lang, "admin_list_admins_btn"), callback_data="admin_list_admins")],
             [InlineKeyboardButton(get_text(lang, "admin_users_btn"), callback_data="admin_users"), InlineKeyboardButton(get_text(lang, "admin_all_users_btn"), callback_data="users_page:1")],
-            [InlineKeyboardButton(get_text(lang, "admin_tickets_btn"), callback_data="admin_tickets")],
+            [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
             [InlineKeyboardButton(get_text(lang, "admin_caption_btn"), callback_data="admin_caption_menu"), InlineKeyboardButton(get_text(lang, "admin_broadcast_btn"), callback_data="admin_broadcast")],
+            [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
             [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
         ]
-        await query.edit_message_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await query.edit_message_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
+
+    if data.startswith("users_page:") and is_admin(user_id):
+        page = int(data.split(":")[1])
+        rows, total_pages = get_users_page(page, 10)
         
+        keyboard = []
+        for u in rows:
+            uid, _, uname, fname, _, banned, _ = u
+            display_name = fname or uname or f"ID: {uid}"
+            if banned:
+                display_name = f"🚫 {display_name}"
+            keyboard.append([InlineKeyboardButton(display_name, callback_data=f"usr_view:{uid}")])
+            
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"users_page:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+            
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        
+        text = get_text(lang, "users_list_title").format(page=page, total=total_pages)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data == "admin_caption_menu" and is_admin(user_id):
+        bot_en = execute_query("SELECT value FROM settings WHERE key = 'caption_bot_enabled'", fetchone=True)
+        custom_txt = execute_query("SELECT value FROM settings WHERE key = 'caption_custom_text'", fetchone=True)
+        is_bot_on = bot_en and bot_en[0] == "true"
+        custom_val = custom_txt[0] if custom_txt and custom_txt[0] else "Не задано"
+        
+        status_str = "Ввімкнено 🟢" if is_bot_on else "Вимкнено 🔴"
+        text = get_text(lang, "caption_menu_title").format(bot_status=status_str, custom_text=custom_val)
+        
+        keyboard = [
+            [InlineKeyboardButton(get_text(lang, "toggle_bot_caption_btn").format(status=status_str), callback_data="caption_toggle_bot")],
+            [InlineKeyboardButton(get_text(lang, "edit_custom_caption_btn"), callback_data="caption_set_custom")],
+            [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data == "caption_toggle_bot" and is_admin(user_id):
+        bot_en = execute_query("SELECT value FROM settings WHERE key = 'caption_bot_enabled'", fetchone=True)
+        is_bot_on = bot_en and bot_en[0] == "true"
+        new_state = "false" if is_bot_on else "true"
+        execute_query("UPDATE settings SET value = ? WHERE key = 'caption_bot_enabled'", (new_state,), commit=True)
+        await handle_callback(update, context) 
+        return
+
+    if data == "caption_set_custom" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_caption_custom"
+        await query.edit_message_text(get_text(lang, "caption_prompt"), reply_markup=get_cancel_inline(lang, "admin_caption_menu"))
+        return
+
+    if data == "admin_broadcast" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_broadcast_message"
+        await query.edit_message_text(get_text(lang, "broadcast_prompt"), reply_markup=get_cancel_inline(lang, "admin_menu"))
+        return
+
+    if data == "broadcast_confirm_send" and is_admin(user_id):
+        source = context.user_data.get("broadcast_source")
+        if not source:
+            await query.answer("❌ Повідомлення не знайдено.", show_alert=True)
+            return
+        chat_id, msg_id = source
+        context.user_data["admin_state"] = None
+        await query.edit_message_text(get_text(lang, "broadcast_started"))
+        
+        users = execute_query("SELECT user_id FROM users WHERE is_banned = FALSE", fetchall=True)
+        success = 0
+        failed = 0
+        for u in users:
+            uid = u[0]
+            try:
+                await context.bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
+                success += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                failed += 1
+                
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=get_text(lang, "broadcast_finished").format(success=success, failed=failed)
+        )
+        return
+
     if data == "admin_list_admins" and is_admin(user_id):
         admins = get_all_admins_info()
-        kb = [[InlineKeyboardButton(f"👑 {adm[3]}", callback_data=f"adm_view:{adm[0]}")] for adm in admins]
-        kb.append([InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")])
-        kb.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
-        await query.edit_message_text(get_text(lang, "admins_list_title"), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        keyboard = []
+        for adm in admins:
+            name = adm[3] or f"ID: {adm[0]}"
+            keyboard.append([InlineKeyboardButton(f"👑 {name}", callback_data=f"adm_view:{adm[0]}")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        await query.edit_message_text(get_text(lang, "admins_list_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
         
     if data.startswith("adm_view:") and is_admin(user_id):
         adm_id = int(data.split(":")[1])
         info = get_admin_info(adm_id)
         if not info: return
-        adder_name = info[4] if info[4] else ("Система" if info[1] == 0 else "Unknown")
-        text = get_text(lang, "admin_info").format(name=info[3], id=info[0], date=info[2], added_by=adder_name)
-        kb = [[InlineKeyboardButton(get_text(lang, "admin_hist_btn"), callback_data=f"adm_hist:{adm_id}")]]
-        if adm_id != INITIAL_ADMIN_ID: kb.append([InlineKeyboardButton(get_text(lang, "admin_del_btn"), callback_data=f"adm_del:{adm_id}")])
-        kb.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_admins")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        text = get_text(lang, "admin_info").format(name=info[3] or "Unknown", id=info[0], date=info[2] or "-", added_by=info[1] or "-")
+        keyboard = []
+        if adm_id != INITIAL_ADMIN_ID:
+            keyboard.append([InlineKeyboardButton(get_text(lang, "delete_btn"), callback_data=f"adm_del:{adm_id}")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_admins")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
         
-    if data.startswith("adm_hist:") and is_admin(user_id):
-        adm_id = int(data.split(":")[1])
-        hist = get_admin_history(adm_id)
-        text = f"🕒 **Історія ({adm_id}):**\n\n"
-        if not hist: text += get_text(lang, "admin_history_empty")
-        for h in hist: text += f"• `{h[1]}`: {h[0]}\n"
-        kb = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data=f"adm_view:{adm_id}")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        return
-
     if data.startswith("adm_del:") and is_admin(user_id):
-        remove_admin(int(data.split(":")[1]), user_id)
-        await query.answer("✅", show_alert=True)
-        await handle_callback(Update(update.update_id, callback_query=type('obj', (object,), {'data': 'admin_list_admins', 'answer': query.answer, 'edit_message_text': query.edit_message_text, 'message': query.message})()), context)
+        adm_id = int(data.split(":")[1])
+        if adm_id == INITIAL_ADMIN_ID:
+            await query.answer(get_text(lang, "cant_delete_owner"), show_alert=True)
+            return
+        remove_admin(adm_id)
+        await query.answer(get_text(lang, "admin_deleted"), show_alert=True)
+        admins = get_all_admins_info()
+        keyboard = [[InlineKeyboardButton(f"👑 {adm[3] or adm[0]}", callback_data=f"adm_view:{adm[0]}")] for adm in admins]
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin"), InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        await query.edit_message_text(get_text(lang, "admins_list_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    if data.startswith("users_page:") and is_admin(user_id):
-        page = int(data.split(":")[1])
-        rows, total = get_users_page(page, 10)
-        kb = []
-        for u in rows:
-            name = f"🚫 {u[3] or u[2]}" if u[5] else (u[3] or u[2] or f"ID: {u[0]}")
-            kb.append([InlineKeyboardButton(name, callback_data=f"usr_view:{u[0]}")])
-        nav = []
-        if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page:{page-1}"))
-        if page < total: nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page+1}"))
-        if nav: kb.append(nav)
-        kb.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
-        await query.edit_message_text(f"👥 Сторінка {page}/{total}", reply_markup=InlineKeyboardMarkup(kb))
+    if data == "admin_add_admin" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_admin_id"
+        await query.edit_message_text(get_text(lang, "admin_enter_admin_id"), reply_markup=get_cancel_inline(lang, "cancel_to_admin_menu"))
+        return
+
+    if data == "admin_cookies" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_cookies"
+        await query.edit_message_text(get_text(lang, "admin_enter_cookies"), reply_markup=get_cancel_inline(lang, "cancel_to_admin_menu"), parse_mode="Markdown")
         return
         
+    if data == "admin_users" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_user_search"
+        await query.edit_message_text(get_text(lang, "admin_search_user_prompt"), reply_markup=get_cancel_inline(lang, "cancel_to_admin_menu"))
+        return
+        
+    if data.startswith("usr_ban:") and is_admin(user_id):
+        target_id = int(data.split(":")[1])
+        set_user_ban(target_id, True)
+        await query.answer(get_text(lang, "user_banned_success"), show_alert=True)
+        data = f"usr_view:{target_id}"
+        
+    if data.startswith("usr_unban:") and is_admin(user_id):
+        target_id = int(data.split(":")[1])
+        set_user_ban(target_id, False)
+        await query.answer(get_text(lang, "user_unbanned_success"), show_alert=True)
+        data = f"usr_view:{target_id}"
+
     if data.startswith("usr_view:") and is_admin(user_id):
         target_id = int(data.split(":")[1])
         info = get_user_info(target_id)
-        text = get_text(lang, "user_info_admin").format(name=info[3] or info[2] or f"ID:{target_id}", id=info[0], last_active=info[7], downloads=info[4], banned="🔴 Так" if info[5] else "🟢 Ні")
-        kb = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist_full:{target_id}")]]
-        if not info[5]: kb.append([InlineKeyboardButton(get_text(lang, "make_admin_btn"), callback_data=f"usr_mk_adm:{target_id}")])
-        if info[5]: kb.append([InlineKeyboardButton(get_text(lang, "unban_btn"), callback_data=f"usr_unban:{target_id}")])
-        else: kb.append([InlineKeyboardButton(get_text(lang, "ban_btn"), callback_data=f"usr_ban:{target_id}")])
-        kb.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="users_page:1")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        if not info:
+            await query.answer(get_text(lang, "user_not_found"), show_alert=True)
+            return
+        
+        banned = info[5]
+        last_act = info[7] if (len(info) > 7 and info[7]) else (info[6] if len(info) > 6 else "-")
+        
+        text = get_text(lang, "user_info_admin").format(
+            name=info[3] or info[2] or f"ID: {target_id}", 
+            id=info[0], 
+            last_active=last_act, 
+            downloads=info[4] if len(info)>4 else 0,
+            banned="🔴 Так" if banned else "🟢 Ні"
+        )
+        keyboard = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist:{target_id}")]]
+        if banned: keyboard[0].append(InlineKeyboardButton(get_text(lang, "unban_btn"), callback_data=f"usr_unban:{target_id}"))
+        else: keyboard[0].append(InlineKeyboardButton(get_text(lang, "ban_btn"), callback_data=f"usr_ban:{target_id}"))
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="users_page:1")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
         
-    if data.startswith("usr_mk_adm:") and is_admin(user_id):
-        add_admin(int(data.split(":")[1]), user_id)
-        await query.answer("✅", show_alert=True)
-        return
-        
-    if data.startswith("usr_hist_full:") and is_admin(user_id):
+    if data.startswith("usr_hist:") and is_admin(user_id):
         target_id = int(data.split(":")[1])
-        hist = get_user_history_all(target_id)
-        msg = get_text(lang, "user_history_title").format(id=target_id)
-        if not hist: msg += "Пусто"
-        for i, h in enumerate(hist[:30]): msg += f"{i+1}. `{h[1]}` - {h[0]}\n"
-        if len(hist) > 30: msg += f"\n...і ще {len(hist)-30} записів."
-        kb = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data=f"usr_view:{target_id}")]]
-        await query.edit_message_text(msg[:4000], reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown", disable_web_page_preview=True)
-        return
+        hist = get_user_history(target_id, 10)
+        text = get_text(lang, "user_history_title").format(id=target_id)
+        if not hist:
+            text += get_text(lang, "user_history_empty")
+        else:
+            for i, h in enumerate(hist):
+                text += f"{i+1}. `{h[1]}`\n🔗 {h[0]}\n"
         
-    if data == "admin_broadcast" and is_admin(user_id):
-        context.user_data["admin_state"] = "await_bc_msg"
-        await query.edit_message_text("Надішліть повідомлення для розсилки:", reply_markup=get_cancel_inline(lang, "admin_menu"))
-        return
-    if data.startswith("bc_type:") and is_admin(user_id):
-        btype = data.split(":")[1]
-        source = context.user_data.get("broadcast_source")
-        if btype == "imm":
-            await query.edit_message_text("⏳ Розсилка...")
-            success, failed = 0, 0
-            users = execute_query("SELECT user_id FROM users WHERE is_banned = FALSE", fetchall=True)
-            for u in users:
-                try:
-                    await context.bot.copy_message(chat_id=u[0], from_chat_id=source[0], message_id=source[1])
-                    success += 1; await asyncio.sleep(0.04)
-                except: failed += 1
-            await query.edit_message_text(f"✅ Готово. Успіх: {success}, Помилок: {failed}")
-        elif btype == "counter":
-            context.user_data["admin_state"] = "await_bc_counter"
-            await query.edit_message_text("Введіть число N (кожен N-й запит):")
+        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data=f"usr_view:{target_id}")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown", disable_web_page_preview=True)
         return
 
-    # --- INLINE & DOWNLOADS ---
-    if data.startswith("i_audio:") or data.startswith("i_video:"):
-        is_video = data.startswith("i_video:")
+    if data == "admin_add_channel" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_channel_data"
+        await query.edit_message_text(get_text(lang, "admin_enter_channel_data"), reply_markup=get_cancel_inline(lang, "admin_list_channels"), parse_mode="Markdown")
+        return
+
+    if data == "admin_list_channels" and is_admin(user_id):
+        channels = get_sponsored_channels()
+        keyboard = [[InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")] for ch in channels]
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        text = get_text(lang, "sponsors_list_title") if channels else get_text(lang, "sponsors_empty")
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data.startswith("sp_view:") and is_admin(user_id):
+        ch_id = data.split(":", 1)[1]
+        ch = get_sponsored_channel(ch_id)
+        if not ch: return
+        text = get_text(lang, "sponsor_info").format(title=ch['title'], id=ch['id'], link=ch['link'])
+        keyboard = [
+            [InlineKeyboardButton(get_text(lang, "edit_btn"), callback_data=f"sp_edit:{ch_id}"), InlineKeyboardButton(get_text(lang, "delete_btn"), callback_data=f"sp_del:{ch_id}")],
+            [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_channels")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data.startswith("sp_del:") and is_admin(user_id):
+        ch_id = data.split(":", 1)[1]
+        delete_sponsored_channel(ch_id)
+        await query.answer(get_text(lang, "sponsor_deleted"), show_alert=True)
+        channels = get_sponsored_channels()
+        keyboard = [[InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")] for ch in channels]
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel"), InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        await query.edit_message_text(get_text(lang, "sponsors_list_title") if channels else get_text(lang, "sponsors_empty"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data.startswith("sp_edit:") and is_admin(user_id):
+        ch_id = data.split(":", 1)[1]
+        context.user_data["admin_state"] = f"await_edit_channel:{ch_id}"
+        await query.edit_message_text(get_text(lang, "edit_sponsor_prompt"), reply_markup=get_cancel_inline(lang, f"sp_view:{ch_id}"), parse_mode="Markdown")
+        return
+
+    # --- INLINE / WEBHOOK CALLBACKS ---
+    if data.startswith("i_audio:"):
         url_id = int(data.split(":")[1])
         url = get_inline_url(url_id)
         if not url:
             await query.answer(get_text(lang, "link_lost"), show_alert=True)
             return
-
-        if is_video:
-            await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=get_text(lang, "fetching_qualities"))
-            qualities, title = await asyncio.to_thread(get_video_formats_info, url)
-            if not qualities:
-                await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=get_text(lang, "no_qualities"))
-                return
-            kb = [[InlineKeyboardButton(f"🎬 {q['height']}p (~{q['size_mb']} MB)", callback_data=f"i_vdl:{url_id}:{q['height']}")] for q in qualities]
-            await context.bot.edit_message_reply_markup(inline_message_id=query.inline_message_id, reply_markup=InlineKeyboardMarkup(kb))
-            return
-
-        # Audio Inline
-        await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=get_text(lang, "downloading_audio"))
-        workdir = tempfile.mkdtemp(prefix="yt_tg_")
-        try:
-            filepath, info = await asyncio.to_thread(download_audio, url, workdir)
-            file_size = os.path.getsize(filepath)
-            increment_downloads(user_id, url)
-            await check_trigger_broadcast(context.bot, user_id)
-            caption = get_file_caption(context.bot.username) or ""
-
-            if file_size <= MAX_FILE_SIZE:
-                # Хитрість: завантажуємо файл в особисті повідомлення користувача, беремо file_id, видаляємо, і редагуємо інлайн повідомлення!
-                with open(filepath, "rb") as f:
-                    msg = await context.bot.send_audio(chat_id=user_id, audio=f, title=info.get("title")[:64], performer=info.get("uploader"), disable_notification=True)
-                file_id = msg.audio.file_id
-                await context.bot.edit_message_media(inline_message_id=query.inline_message_id, media=InputMediaAudio(media=file_id, caption=caption, parse_mode="Markdown"))
-            else:
-                safe_name = f"{int(time.time())}_{Path(filepath).name}"
-                shutil.move(filepath, DOWNLOADS_DIR / safe_name)
-                mb_size = round(file_size / (1024 * 1024), 1)
-                text = get_text(lang, "file_too_large_audio").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}", caption=caption)
-                await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=text, parse_mode="Markdown")
-        except Exception as error:
-            await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=f"❌ {human_youtube_error(error)}")
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
-        return
-
-    if data.startswith("i_vdl:"):
-        _, url_id, height = data.split(":")
-        url = get_inline_url(int(url_id))
-        if not url: return
-        await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=get_text(lang, "downloading_video").format(height=height))
-        workdir = tempfile.mkdtemp(prefix="yt_tg_")
-        try:
-            filepath, info = await asyncio.to_thread(download_video_quality, url, workdir, int(height))
-            file_size = os.path.getsize(filepath)
-            increment_downloads(user_id, url)
-            await check_trigger_broadcast(context.bot, user_id)
-            caption = get_file_caption(context.bot.username) or ""
-
-            if file_size <= MAX_FILE_SIZE:
-                with open(filepath, "rb") as f:
-                    msg = await context.bot.send_video(chat_id=user_id, video=f, supports_streaming=True, disable_notification=True)
-                file_id = msg.video.file_id
-                await context.bot.edit_message_media(inline_message_id=query.inline_message_id, media=InputMediaVideo(media=file_id, caption=caption, parse_mode="Markdown"))
-            else:
-                safe_name = f"{int(time.time())}_{Path(filepath).name}"
-                shutil.move(filepath, DOWNLOADS_DIR / safe_name)
-                mb_size = round(file_size / (1024 * 1024), 1)
-                text = get_text(lang, "file_too_large_video").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}", caption=caption)
-                await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=text, parse_mode="Markdown")
-        except Exception as error:
-            await context.bot.edit_message_caption(inline_message_id=query.inline_message_id, caption=f"❌ {human_youtube_error(error)}")
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
-        return
-
-    # Звичайний режим бота
-    if data == "audio" or data == "video":
-        url = context.user_data.get("url")
-        if not url: return
-        
-        if data == "video":
-            status = await query.edit_message_text(get_text(lang, "fetching_qualities"))
-            qualities, title = await asyncio.to_thread(get_video_formats_info, url)
-            if not qualities:
-                await status.edit_text(get_text(lang, "no_qualities"))
-                return
-            kb = [[InlineKeyboardButton(f"🎬 {q['height']}p (~{q['size_mb']} MB)", callback_data=f"vdl:{q['height']}")] for q in qualities]
-            await status.edit_text(get_text(lang, "choose_quality").format(title=title[:60]), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-            return
-            
         status = await query.edit_message_text(get_text(lang, "downloading_audio"))
         workdir = tempfile.mkdtemp(prefix="yt_tg_")
         try:
             filepath, info = await asyncio.to_thread(download_audio, url, workdir)
             file_size = os.path.getsize(filepath)
             increment_downloads(user_id, url)
-            await check_trigger_broadcast(context.bot, user_id)
             caption = get_file_caption(context.bot.username)
 
             if file_size <= MAX_FILE_SIZE:
                 with open(filepath, "rb") as f:
-                    await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=info.get("title")[:64], performer=info.get("uploader"), caption=caption, parse_mode="Markdown")
+                    await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=info.get("title", "audio")[:64], performer=info.get("artist") or info.get("uploader"), duration=int(info.get("duration", 0)) or None, caption=caption, parse_mode="Markdown")
                 await status.delete()
             else:
                 safe_name = f"{int(time.time())}_{Path(filepath).name}"
                 shutil.move(filepath, DOWNLOADS_DIR / safe_name)
-                text = get_text(lang, "file_too_large_audio").format(mb=round(file_size/(1024*1024),1), link=f"{PUBLIC_URL}/download/{safe_name}", caption=caption or "")
-                await status.edit_text(text, parse_mode="Markdown")
+                mb_size = round(file_size / (1024 * 1024), 1)
+                await status.edit_text(get_text(lang, "file_too_large_audio").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}"), parse_mode="Markdown")
         except Exception as error:
+            logger.exception("Inline Download failed")
             await status.edit_text(f"❌ {human_youtube_error(error)}")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+        return
 
-    if data.startswith("vdl:"):
-        height = int(data.split(":")[1])
-        url = context.user_data.get("url")
+    if data.startswith("i_video:"):
+        url_id = int(data.split(":")[1])
+        url = get_inline_url(url_id)
+        if not url:
+            await query.answer(get_text(lang, "link_lost"), show_alert=True)
+            return
+        status = await query.edit_message_text(get_text(lang, "fetching_qualities"))
+        try:
+            qualities, title = await asyncio.to_thread(get_video_formats_info, url)
+            if not qualities:
+                await status.edit_text(get_text(lang, "no_qualities"))
+                return
+
+            keyboard = [[InlineKeyboardButton(f"🎬 {q['height']}p (~{q['size_mb']} МБ)", callback_data=f"i_vdl:{url_id}:{q['height']}")] for q in qualities]
+            await status.edit_text(get_text(lang, "choose_quality").format(title=title[:60]), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        except Exception as error:
+            logger.exception("Format fetch failed")
+            await status.edit_text(f"❌ {human_youtube_error(error)}")
+        return
+
+    if data.startswith("i_vdl:"):
+        parts = data.split(":")
+        url_id = int(parts[1])
+        height = int(parts[2])
+        url = get_inline_url(url_id)
+        if not url:
+            await query.answer(get_text(lang, "link_lost"), show_alert=True)
+            return
         status = await query.edit_message_text(get_text(lang, "downloading_video").format(height=height))
         workdir = tempfile.mkdtemp(prefix="yt_tg_")
         try:
             filepath, info = await asyncio.to_thread(download_video_quality, url, workdir, height)
             file_size = os.path.getsize(filepath)
             increment_downloads(user_id, url)
-            await check_trigger_broadcast(context.bot, user_id)
             caption = get_file_caption(context.bot.username)
 
             if file_size <= MAX_FILE_SIZE:
                 with open(filepath, "rb") as f:
-                    await context.bot.send_video(chat_id=query.message.chat_id, video=f, supports_streaming=True, caption=caption, parse_mode="Markdown")
+                    await context.bot.send_video(chat_id=query.message.chat_id, video=f, supports_streaming=True, duration=int(info.get("duration", 0)) or None, caption=caption, parse_mode="Markdown")
                 await status.delete()
             else:
                 safe_name = f"{int(time.time())}_{Path(filepath).name}"
                 shutil.move(filepath, DOWNLOADS_DIR / safe_name)
-                text = get_text(lang, "file_too_large_video").format(mb=round(file_size/(1024*1024),1), link=f"{PUBLIC_URL}/download/{safe_name}", caption=caption or "")
-                await status.edit_text(text, parse_mode="Markdown")
+                mb_size = round(file_size / (1024 * 1024), 1)
+                await status.edit_text(get_text(lang, "file_too_large_video").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}"), parse_mode="Markdown")
         except Exception as error:
+            logger.exception("Inline Download failed")
             await status.edit_text(f"❌ {human_youtube_error(error)}")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+        return
+
+    # --- STANDARD DOWNLOAD CALLBACKS ---
+    if data == "back_to_format":
+        url = context.user_data.get("url")
+        if url: await send_format_selection(query.message, url, lang, is_edit=True)
+        else: await query.edit_message_text(get_text(lang, "link_lost"))
+        return
+
+    url = context.user_data.get("url")
+    if not url:
+        return
+
+    if data == "video":
+        status = await query.edit_message_text(get_text(lang, "fetching_qualities"))
+        try:
+            qualities, title = await asyncio.to_thread(get_video_formats_info, url)
+            if not qualities:
+                await status.edit_text(get_text(lang, "no_qualities"))
+                return
+
+            keyboard = [[InlineKeyboardButton(f"🎬 {q['height']}p (~{q['size_mb']} МБ)", callback_data=f"vdl:{q['height']}")] for q in qualities]
+            keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="back_to_format")])
+            await status.edit_text(get_text(lang, "choose_quality").format(title=title[:60]), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        except Exception as error:
+            logger.exception("Format fetch failed")
+            await status.edit_text(f"❌ {human_youtube_error(error)}")
+        return
+
+    if data.startswith("vdl:"):
+        height = int(data.split(":")[1])
+        status = await query.edit_message_text(get_text(lang, "downloading_video").format(height=height))
+        workdir = tempfile.mkdtemp(prefix="yt_tg_")
+        try:
+            filepath, info = await asyncio.to_thread(download_video_quality, url, workdir, height)
+            file_size = os.path.getsize(filepath)
+            increment_downloads(user_id, url)
+            caption = get_file_caption(context.bot.username)
+
+            if file_size <= MAX_FILE_SIZE:
+                with open(filepath, "rb") as f:
+                    await context.bot.send_video(chat_id=query.message.chat_id, video=f, supports_streaming=True, duration=int(info.get("duration", 0)) or None, caption=caption, parse_mode="Markdown")
+                await status.delete()
+            else:
+                safe_name = f"{int(time.time())}_{Path(filepath).name}"
+                shutil.move(filepath, DOWNLOADS_DIR / safe_name)
+                mb_size = round(file_size / (1024 * 1024), 1)
+                await status.edit_text(get_text(lang, "file_too_large_video").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}"), parse_mode="Markdown")
+        except Exception as error:
+            logger.exception("Download failed")
+            await status.edit_text(f"❌ {human_youtube_error(error)}")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return
+
+    if data == "audio":
+        status = await query.edit_message_text(get_text(lang, "downloading_audio"))
+        workdir = tempfile.mkdtemp(prefix="yt_tg_")
+        try:
+            filepath, info = await asyncio.to_thread(download_audio, url, workdir)
+            file_size = os.path.getsize(filepath)
+            increment_downloads(user_id, url)
+            caption = get_file_caption(context.bot.username)
+
+            if file_size <= MAX_FILE_SIZE:
+                with open(filepath, "rb") as f:
+                    await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=info.get("title", "audio")[:64], performer=info.get("artist") or info.get("uploader"), duration=int(info.get("duration", 0)) or None, caption=caption, parse_mode="Markdown")
+                await status.delete()
+            else:
+                safe_name = f"{int(time.time())}_{Path(filepath).name}"
+                shutil.move(filepath, DOWNLOADS_DIR / safe_name)
+                mb_size = round(file_size / (1024 * 1024), 1)
+                await status.edit_text(get_text(lang, "file_too_large_audio").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}"), parse_mode="Markdown")
+        except Exception as error:
+            logger.exception("Download failed")
+            await status.edit_text(f"❌ {human_youtube_error(error)}")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return
+
 
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_or_update_user(user.id, user.username or "", user.first_name or "")
+    
     query = update.inline_query.query.strip()
+    lang = get_user_lang(user.id)
 
     if not query or not is_youtube_url(query):
+        results = [
+            InlineQueryResultArticle(
+                id="help",
+                title="YouTube Downloader",
+                description="Надішліть посилання на YouTube або YouTube Music",
+                input_message_content=InputTextMessageContent(
+                    message_text="👋 Надішліть посилання на YouTube або YouTube Music у чат з ботом або скористайтесь inline режимом: `@botusername <силка>`"
+                )
+            )
+        ]
+        await update.inline_query.answer(results, cache_time=1)
         return
 
     url_id = save_inline_url(query)
-    yt_id = extract_yt_id(query)
-    thumb = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg" if yt_id else "https://via.placeholder.com/640x360.png?text=YouTube"
-
+    
     results = [
-        InlineQueryResultPhoto(
+        InlineQueryResultArticle(
             id=str(url_id),
-            photo_url=thumb,
-            thumb_url=thumb,
-            title="📥 Завантажити медіа",
-            caption=f"🔗 **Посилання:** {query}\n\nОберіть формат:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Аудіо", callback_data=f"i_audio:{url_id}"), InlineKeyboardButton("🎬 Відео", callback_data=f"i_video:{url_id}")]])
+            title="📥 Завантажити медіа з YouTube",
+            description=query,
+            input_message_content=InputTextMessageContent(
+                message_text=f"🔗 **Посилання:** {query}\n\nОберіть формат завантаження:",
+                parse_mode="Markdown"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🎵 Аудіо", callback_data=f"i_audio:{url_id}"),
+                    InlineKeyboardButton("🎬 Відео", callback_data=f"i_video:{url_id}")
+                ]
+            ])
         )
     ]
     await update.inline_query.answer(results, cache_time=1)
 
+
+async def handle_admin_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id): return
+    state = context.user_data.get("admin_state")
+    lang = get_user_lang(user_id)
+    
+    if state == "await_cookies" and update.message.document:
+        doc = update.message.document
+        file = await context.bot.get_file(doc.file_id)
+        file_bytes = await file.download_as_bytearray()
+        content = file_bytes.decode('utf-8', errors='ignore')
+        save_db_cookies(content)
+        context.user_data["admin_state"] = None
+        await update.message.reply_text(get_text(lang, "cookies_updated"))
+
+
 async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, state: str, lang: str):
     user_id = update.effective_user.id
-    if state == "await_bc_msg":
-        context.user_data["broadcast_source"] = (update.effective_chat.id, update.message.message_id)
-        kb = [[InlineKeyboardButton(get_text(lang, "bc_immediate"), callback_data="bc_type:imm")],
-              [InlineKeyboardButton(get_text(lang, "bc_counter"), callback_data="bc_type:counter")]]
-        await update.message.reply_text(get_text(lang, "broadcast_menu"), reply_markup=InlineKeyboardMarkup(kb))
-    elif state == "await_bc_counter":
+    if not is_admin(user_id): return
+
+    if state == "await_cookies":
+        save_db_cookies(text)
+        context.user_data["admin_state"] = None
+        await update.message.reply_text(get_text(lang, "cookies_updated"))
+        
+    elif state == "await_admin_id":
         if text.isdigit():
-            execute_query("INSERT INTO broadcasts (b_type, b_val, chat_id, msg_id, status) VALUES ('counter', ?, ?, ?, 'active')", (text, context.user_data["broadcast_source"][0], context.user_data["broadcast_source"][1]), commit=True)
+            new_admin_id = int(text)
+            add_admin(new_admin_id, added_by=user_id)
             context.user_data["admin_state"] = None
-            await update.message.reply_text(f"✅ Розсилку встановлено на кожен {text}-й запит користувача.")
+            await update.message.reply_text(get_text(lang, "admin_admin_added"))
         else:
-            await update.message.reply_text("❌ Введіть число.")
+            await update.message.reply_text(get_text(lang, "admin_invalid_id"))
+            
+    elif state == "await_user_search":
+        if text.isdigit():
+            target_id = int(text)
+            info = get_user_info(target_id)
+            if not info:
+                await update.message.reply_text(get_text(lang, "user_not_found"))
+                return
+            context.user_data["admin_state"] = None
+            
+            banned = info[5]
+            last_act = info[7] if (len(info) > 7 and info[7]) else (info[6] if len(info) > 6 else "-")
+            
+            profile_text = get_text(lang, "user_info_admin").format(
+                name=info[3] or info[2] or f"ID: {target_id}", 
+                id=info[0], 
+                last_active=last_act, 
+                downloads=info[4] if len(info)>4 else 0,
+                banned="🔴 Так" if banned else "🟢 Ні"
+            )
+            keyboard = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist:{target_id}")]]
+            if banned: keyboard[0].append(InlineKeyboardButton(get_text(lang, "unban_btn"), callback_data=f"usr_unban:{target_id}"))
+            else: keyboard[0].append(InlineKeyboardButton(get_text(lang, "ban_btn"), callback_data=f"usr_ban:{target_id}"))
+            keyboard.append([InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")])
+            
+            await update.message.reply_text(profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(get_text(lang, "admin_invalid_id"))
+
+    elif state == "await_channel_data":
+        parts = text.split(maxsplit=2)
+        if len(parts) == 3:
+            add_sponsored_channel(parts[0], parts[1], parts[2])
+            context.user_data["admin_state"] = None
+            await update.message.reply_text(get_text(lang, "admin_channel_added").format(title=parts[1]), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(get_text(lang, "admin_invalid_channel_format"))
+
+    elif state.startswith("await_edit_channel:"):
+        ch_id = state.split(":", 1)[1]
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            update_sponsored_channel(ch_id, parts[0], parts[1])
+            context.user_data["admin_state"] = None
+            await update.message.reply_text(get_text(lang, "sponsor_updated"))
+        else:
+            await update.message.reply_text("❌ Формат: `Назва Посилання`")
+
+    elif state == "await_caption_custom":
+        val = "" if text == "-" else text
+        execute_query("UPDATE settings SET value = ? WHERE key = 'caption_custom_text'", (val,), commit=True)
+        context.user_data["admin_state"] = None
+        await update.message.reply_text(get_text(lang, "caption_saved"))
+
+    elif state == "await_broadcast_message":
+        context.user_data["broadcast_source"] = (update.effective_chat.id, update.message.message_id)
+        context.user_data["admin_state"] = "await_broadcast_confirm"
+        keyboard = [[InlineKeyboardButton(get_text(lang, "broadcast_confirm_btn"), callback_data="broadcast_confirm_send")],
+                    [InlineKeyboardButton(get_text(lang, "cancel_btn"), callback_data="cancel_to_admin_menu")]]
+        await update.message.reply_text("📋 Попередній перегляд повідомлення для розсилки вище ⬆️\nПідтвердіть відправку:", reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 # =========================================================
-# APPLICATION SETUP
+# APPLICATION SETUP & LIFESPAN
 # =========================================================
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
+
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(InlineQueryHandler(inline_query_handler))
+telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_doc))
 telegram_app.add_handler(MessageHandler(filters.TEXT, master_text_handler))
 telegram_app.add_handler(CallbackQueryHandler(handle_callback))
+
+
+async def keep_alive_ping():
+    await asyncio.sleep(10)
+    while True:
+        try:
+            if PUBLIC_URL:
+                ping_url = f"{PUBLIC_URL}/health"
+                def do_ping():
+                    import urllib.request
+                    req = urllib.request.Request(ping_url, headers={"User-Agent": "RenderKeepAlive/1.0"})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.status
+                status = await asyncio.to_thread(do_ping)
+                logger.info("Keep-alive ping to %s returned status %s", ping_url, status)
+        except Exception as e:
+            logger.warning("Keep-alive ping failed: %s", e)
+        await asyncio.sleep(600)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1098,27 +1531,53 @@ async def lifespan(app: FastAPI):
     start_bgutil_provider()
     await telegram_app.initialize()
     await telegram_app.start()
+    
     await setup_bot_commands(telegram_app.bot)
-    await telegram_app.bot.set_webhook(url=f"{PUBLIC_URL}/telegram/webhook", secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None, allowed_updates=Update.ALL_TYPES)
+    
+    await telegram_app.bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+    ping_task = asyncio.create_task(keep_alive_ping())
     yield
-    await telegram_app.stop()
-    await telegram_app.shutdown()
-    stop_bgutil_provider()
+    ping_task.cancel()
+    try:
+        await telegram_app.stop()
+    finally:
+        await telegram_app.shutdown()
+        stop_bgutil_provider()
+
 
 app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+async def root():
+    return PlainTextResponse("YouTube Bot is running.")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.get("/download/{filename}")
 async def get_download_file(filename: str):
     file_path = DOWNLOADS_DIR / filename
-    if file_path.is_file(): return FileResponse(file_path, media_type="application/octet-stream", filename=filename)
-    raise HTTPException(status_code=404)
+    if file_path.is_file():
+        return FileResponse(file_path, media_type="application/octet-stream", filename=filename)
+    raise HTTPException(status_code=404, detail="Файл не знайдено або термін дії посилання вичерпано")
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401)
-    await telegram_app.update_queue.put(Update.de_json(await request.json(), telegram_app.bot))
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.update_queue.put(update)
     return PlainTextResponse("OK")
+
 
 if __name__ == "__main__":
     import uvicorn
