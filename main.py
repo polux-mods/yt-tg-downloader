@@ -1099,7 +1099,7 @@ async def lifespan(app: FastAPI):
     await telegram_app.initialize()
     await telegram_app.start()
     await setup_bot_commands(telegram_app.bot)
-    await telegram_app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None, allowed_updates=Update.ALL_TYPES)
+    await telegram_app.bot.set_webhook(url=f"{PUBLIC_URL}/telegram/webhook", secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None, allowed_updates=Update.ALL_TYPES)
     yield
     await telegram_app.stop()
     await telegram_app.shutdown()
